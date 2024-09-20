@@ -57,6 +57,22 @@ pub struct DataViewer {
 
     #[serde(default)]
     pub data: HashMap<String, Vec<f64>>,
+
+    #[serde(skip)]
+    pub info: Info,
+}
+
+#[derive(Debug, PartialEq, Default, Clone)]
+pub struct Info {
+    pub uid_count: u32,
+    pub uids: HashMap<String, u32>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct Memcontext {
+    allocs: u64,
+    bytes: u64,
+    callstack: String,
 }
 
 impl DataViewer {
@@ -69,7 +85,7 @@ impl DataViewer {
         me.dataview.y_unit = Some("KBytes".into());
 
         let mut chart = Chart::default();
-        chart.title = Some("Memory in use".into());
+        chart.title = Some("Total HEAP Memory in use".into());
 
         me.chart.insert("inuse".into(), chart);
         me
@@ -81,7 +97,7 @@ impl DataViewer {
         Ok(())
     }
 
-    fn add(&mut self, elapsed_sec: i64, inuse: &str) -> eyre::Result<()> {
+    fn add_inuse_summary(&mut self, elapsed_sec: i64, inuse: &str) -> eyre::Result<()> {
         let regex = Regex::new(r"(\d+) bytes").unwrap();
         let captures = regex.captures(inuse).unwrap();
         let bytes = captures.get(1).unwrap().as_str();
@@ -96,6 +112,34 @@ impl DataViewer {
 
         Ok(())
     }
+
+    fn add_memcontexts(&mut self, elapsed_sec: i64, memcontexts: &Vec<Memcontext>) -> eyre::Result<()> {
+        for memcontext in memcontexts {
+            self.add_memcontext(elapsed_sec, memcontext)?;
+        }
+        Ok(())
+    }
+
+    fn add_memcontext(&mut self, elapsed_sec: i64, memcontext: &Memcontext) -> eyre::Result<()> {
+        let elapsed_hour = (elapsed_sec as f64)/(60.0*60.0);
+        let kbytes = (memcontext.bytes as f64)/1000.0;
+        let uid = self.info.uids.entry(memcontext.callstack.clone()).or_insert_with(|| {
+            self.info.uid_count += 1;
+            let uid = self.info.uid_count;
+            let mut chart = Chart::default();
+            chart.title = Some(format!("Memory Context with UID:{}", uid));
+            chart.description = Some(format!("{}", memcontext.callstack));
+            self.chart.insert(format!("{}", uid), chart);
+            uid
+        });
+        let uid = format!("{}", uid);
+        let values = self.data.entry(uid)
+            .or_insert_with(|| vec![]);
+        values.push(elapsed_hour);
+        values.push(kbytes);
+
+        Ok(())
+    }
 }
 
 fn main() -> eyre::Result<()> {
@@ -104,11 +148,40 @@ fn main() -> eyre::Result<()> {
     let fileout = args.file.with_extension("log.toml");
     let lines = io::BufReader::new(file).lines();
     let mut dataviewer = DataViewer::new();
+    let memcontext_regex = Regex::new(r"(\d+) allocs, (\d+) bytes were not free").unwrap();
+    let mut memcontext = Memcontext::default();
+    let mut memcontexts = vec![];
+    let mut in_memcontext = false;
     let mut timestamp = 0;
     let mut min_ts = 0;
 
+
     for line in lines {
         let line = line?;
+
+        if let Some(captures) = memcontext_regex.captures(&line) {
+            memcontext.allocs = captures.get(1)
+                .unwrap()
+                .as_str()
+                .parse()
+                .unwrap();
+            memcontext.bytes = captures.get(2)
+                .unwrap()
+                .as_str()
+                .parse()
+                .unwrap();
+            in_memcontext = true;
+        }
+        else if in_memcontext {
+            memcontext.callstack += &line;
+            memcontext.callstack += "\n";
+            if line.is_empty() {
+                memcontexts.push(memcontext.clone());
+                memcontext = Memcontext::default();
+                in_memcontext = false;
+            }
+            continue;
+        }
 
         if let Some(date) = line.strip_prefix("HEAP SUMMARY ") {
             let format = "%a %b %d %H:%M:%S %Y";
@@ -121,7 +194,9 @@ fn main() -> eyre::Result<()> {
         }
         if let Some(inuse) = line.strip_prefix("    in use: ") {
             let elapsed = timestamp - min_ts;
-            dataviewer.add(elapsed, inuse)?;
+            dataviewer.add_inuse_summary(elapsed, inuse)?;
+            dataviewer.add_memcontexts(elapsed, &memcontexts)?;
+            memcontexts.clear();
         }
     }
 
